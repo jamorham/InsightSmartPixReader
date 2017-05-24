@@ -10,6 +10,19 @@ Using xDrip+ connected to Nightscout via the standard Rest-API feature, the trea
 
 Because the Insight handset can be set to "always connect to PC" and also charges while connected to the Smart Pix device, the data can be automatically synchronized simply by plugging the handset in to charge when it is not in use and data download occurs with no user operation required.
 
+#### Example output:
+
+    2017-05-24 21:49:33,355 : Requesting new data - this can take several minutes
+    2017-05-24 21:49:33,951 : Pix status: 5 NOSCAN
+    2017-05-24 21:49:35,978 : Status changed to: unknown  please wait
+    2017-05-24 21:50:49,162 : Pix status: 8 SCAN BGREQUEST IPREQUEST
+    2017-05-24 21:50:49,164 : Status changed to: running
+    2017-05-24 21:51:10,736 : Pix status: 12 NOSCAN BGREPORT IPREPORT
+    2017-05-24 21:51:10,738 : Status changed to: done
+    2017-05-24 21:51:11,240 : Scan complete after: 97 seconds
+    2017-05-24 21:51:13,385 : Uploaded 259 records successfully in 0 seconds
+
+
 ## What do I need?
 
 This python script is designed to run on a Linux machine, typically a Raspberry Pi.
@@ -27,6 +40,29 @@ Select `Connect to PC` on the Handset screen. Ideally select to always connect t
 You'll need a Nightscout installation and to know your URL and API password
 
 Download the `smart-pix-reader.py` script to your Linux machine
+
+    usage: smart-pix-reader.py [-h] --base_url BASE_URL --api_secret API_SECRET
+                           [--meter_serial METER_SERIAL] [--constant]
+                           [--skip_reload] [--debug] [--timezone TIMEZONE]
+
+    Smart Pix reader - designed for Insight pump/handset. Can upload data to
+    Nightscout and trigger xDrip+ calibrations. Any use is entirely at your own
+    risk, code provided on an 'AS IS' basis only. Not endorsed by any equipment
+    manfacturer.
+
+    optional arguments:
+      -h, --help            show this help message and exit
+      --base_url BASE_URL   Base URL of Nightscout site
+      --api_secret API_SECRET
+                            API-SECRET for uploading
+      --meter_serial METER_SERIAL
+                            Restrict to meter serial number
+      --constant            Run constantly looking for new data
+      --skip_reload         Don't reload new data from the device
+      --debug
+      --timezone TIMEZONE   Timezone to use if not Etc/UTC eg: Europe/London
+
+
 
 
 ### Using the right Timezone!
@@ -47,7 +83,8 @@ For an absolute offset timezone where you don't change the clock for daylight sa
 
 ## Example Usage
 
-    python smart-pix-reader.py --base_url http://example.azurewebsites.net --api_secret mypassw0rd --timezone Europe/London
+    python smart-pix-reader.py --base_url http://example.azurewebsites.net \
+                               --api_secret mypassw0rd --timezone Europe/London
 
 If there is any chance of a different handset being connected then you can lock it to work with only handset using the 8 digit serial number.
 
