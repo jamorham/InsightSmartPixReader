@@ -107,6 +107,45 @@ recursion = 0
 last_status = "startup"
 
 
+class BreakException(Exception):
+    pass
+
+
+def enableRelay(relaypin, state):
+    relaypin = int(relaypin)
+    if relaypin == 0:
+        return
+    logger.debug("Setting relay on pin " + str(relaypin) + " to state " + str(state))
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(relaypin, GPIO.OUT)
+        GPIO.output(relaypin, not state)  # low = on
+    except ImportError:
+        logger.error("Could not import Rpi.GPIO are you running on a raspberry pi?")
+
+
+def waitForPir(pirpin):
+    pirpin = int(pirpin)
+    if (pirpin == 0):
+        return
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(pirpin, GPIO.IN)
+        # GPIO.setup(pirpin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        if GPIO.input(pirpin) == GPIO.HIGH:
+            logger.info("Waiting for motion sensor to report motion has stopped")
+            while GPIO.input(pirpin) == GPIO.HIGH:
+                logger.debug("Motion sensor still reporting motion")
+                time.sleep(10)
+
+    except ImportError:
+        logger.error("Could not import Rpi.GPIO are you running on a raspberry pi?")
+
+
 def checkFstab():
     global recursion
     recursion += 1
@@ -125,10 +164,13 @@ def checkFstab():
 
 
 def getFile(the_file):
-    with open(the_file) as f:
-        content = f.readlines()
-        content = [x.strip() for x in content]
-        return content
+    try:
+        with open(the_file) as f:
+            content = f.readlines()
+            content = [x.strip() for x in content]
+            return content
+    except IOError:
+        logger.error("Got IO error reading: " + the_file)
 
 
 def parseStatus():
@@ -275,6 +317,9 @@ arg_parser.add_argument('--constant', help="Run constantly looking for new data"
 arg_parser.add_argument('--skip_reload', help="Don't reload new data from the device", default=False,
                         action='store_true')
 arg_parser.add_argument('--debug', action='store_true')
+arg_parser.add_argument('--relay_pin', help="Specify which GPIO pin an optional relay is connected", default=0)
+arg_parser.add_argument('--motion_pin', help="Specify which GPIO pin an optional motion sensor is connected to",
+                        default=0)
 arg_parser.add_argument('--timezone', default=str(get_localzone()),
                         help="Timezone to use if not " + str(get_localzone()) + " eg: Europe/London")
 
@@ -303,218 +348,255 @@ if not os.path.exists(DEVICE):
     logger.error("Cannot find the Smart Pix device on your system")
     exit(5)
 
-logger.debug("Device found")
+logger.debug("Smart Pix Device found")
 
-mountPixFolder()
+keepRunning = True
+last_scan_time = 0.0
 
-global processing_seconds
-processing_seconds = 0
-if (reload):
-    logger.info("Requesting new data - this can take several minutes")
+# how frequently to probe if we get errors
+MAX_SCAN_FREQ = 300
+# how long to wait after we get successful data to avoid constantly downloading
+WAIT_BETWEEN_SUCCESSES = 1800
 
-    asf = open(AUTOSCAN_FILE, "w")
-    written = asf.write(
-        "\x53\x4c\x34\x32\x2d\x42\x20\x52\x65\x6d\x6f\x74\x65\x43\x6f\x6e\x74\x72\x6f\x6c\x20\x46\x69\x6c\x65\x0a\x43\x6f\x6d\x6d\x61\x6e\x64\x3d\x41\x75\x74\x6f\x53\x63\x61\x6e")
-    asf.flush()
-    asf.close()
+while keepRunning:
+    global processing_seconds
+    processing_seconds = 0
 
-    logger.debug("Wrote characters to autoscan file")
-
-    # wait for processing
-    last_pix_status = ""
-    pix_status = ""
-    time_start = time.time()
-    while time.time() - time_start < STARTUP_SECONDS or (
-                not (pix_status == "done" or pix_status == "failed") and time.time() - time_start < MAX_WAIT_TIME):
-        pix_status = parseStatus()
-        if not pix_status == last_pix_status:
-            if (time.time() - time_start > STARTUP_SECONDS or pix_status != "done"):
-                logger.info("Status changed to: " + pix_status)
-            last_pix_status = pix_status
-
-        time.sleep(0.5)
-
-    if pix_status == "failed":
-        logger.error("Scan failed - check the meter connected to the smart pix device!")
-        unmountPix()
-        exit(5)
-
-    if not pix_status == "done":
-        logger.error("Timed out after " + str(MAX_WAIT_TIME) + " seconds waiting for scan to complete")
-        if (pix_status.startswith("unknown")):
-            logger.error("Status error - check the meter connected to the smart pix device?")
-        unmountPix()
-        exit(5)
-
-    # we got some data
-    processing_seconds = int(time.time() - time_start)
-    logger.info("Scan complete after: " + str(processing_seconds) + " seconds")
-
-with open(DEVLIST_FILE) as fd:
     try:
-        doc = xmltodict.parse(fd.read())
-        if not 'DEVICE' in doc['DEVICELIST']:
-            logger.error("No device data available - try again")
-            exit(5)
+        if not args.constant:
+            keepRunning = False  # only go one time
+        waitForPir(args.motion_pin)
+        if (args.relay_pin > 0):
+            enableRelay(args.relay_pin, True)
+        mountPixFolder()
+        if (reload):
+            scan_delay = time.time() - last_scan_time
+            while (scan_delay < MAX_SCAN_FREQ):
+                logger.info("Waiting to scan " + str(int((MAX_SCAN_FREQ - scan_delay) / 60)) + " minutes left")
+                time.sleep(60)
+                scan_delay = time.time() - last_scan_time
+            last_scan_time = time.time()
+            logger.info("Requesting new data - this can take several minutes")
 
-        serial = doc['DEVICELIST']['DEVICE']['SERIALNR']
-        dclass = doc['DEVICELIST']['DEVICE']['CLASS']
-        name = doc['DEVICELIST']['DEVICE']['NAME']
-        deviceid = name + " " + serial
+            asf = open(AUTOSCAN_FILE, "w")
+            written = asf.write(
+                "\x53\x4c\x34\x32\x2d\x42\x20\x52\x65\x6d\x6f\x74\x65\x43\x6f\x6e\x74\x72\x6f\x6c\x20\x46\x69\x6c\x65\x0a\x43\x6f\x6d\x6d\x61\x6e\x64\x3d\x41\x75\x74\x6f\x53\x63\x61\x6e")
+            asf.flush()
+            asf.close()
 
-        logger.debug(dclass + " serial number is: " + serial + " name " + name)
+            logger.debug("Wrote characters to autoscan file")
 
-        if (METER_SERIAL != "" and serial != METER_SERIAL):
-            logger.error("Meter serials do not match: " + METER_SERIAL + " vs " + serial)
-            exit(5)
+            # wait for processing
+            last_pix_status = ""
+            pix_status = ""
+            time_start = time.time()
+            while time.time() - time_start < STARTUP_SECONDS or (
+                        not (
+                                        pix_status == "done" or pix_status == "failed") and time.time() - time_start < MAX_WAIT_TIME):
+                pix_status = parseStatus()
+                if not pix_status == last_pix_status:
+                    if (time.time() - time_start > STARTUP_SECONDS or pix_status != "done"):
+                        logger.info("Status changed to: " + pix_status)
+                    last_pix_status = pix_status
 
-        GLUCOSE_FILE = MISC_FOLDER + "G" + serial[1:] + ".XML"
-        if not os.path.exists(GLUCOSE_FILE):
-            logger.error("Could not find glucose data file for meter: " + METER_SERIAL + " try re-running?")
-            exit(7)
+                time.sleep(0.5)
 
-        with open(GLUCOSE_FILE) as gd:
-            gd = xmltodict.parse(gd.read())
-            imp = gd['IMPORT']
-            gdev = imp['DEVICE']
-            pairing = gdev['PAIRING']
-            pumpserial = pairing['@PumpSerialNr']
-            logger.debug("      Paired with pump: " + pumpserial)
-            dt = gdev['@Dt']
-            tm = gdev['@Tm']
-            bgunit = gdev['@BGUnit']
-            logger.debug("Device time is: " + dt + " " + tm)
+            if pix_status == "failed":
+                logger.error("Scan failed - check the meter connected to the smart pix device!")
+                unmountPix()
+                raise BreakException
 
-            meterdt = mytimezone.localize(parser.parse(dt + " " + tm))
-            logger.debug("Meter date time: " + str(meterdt))
-            hostdt = datetime.datetime.now(mytimezone)
-            logger.debug(" Host date time: " + str(hostdt))
-            timediff = hostdt - meterdt
+            if not pix_status == "done":
+                logger.error("Timed out after " + str(MAX_WAIT_TIME) + " seconds waiting for scan to complete")
+                if (pix_status.startswith("unknown")):
+                    logger.error("Status error - check the meter connected to the smart pix device?")
+                unmountPix()
+                raise BreakException
 
-            adjusted_timediff_seconds = timediff.seconds - (processing_seconds - STARTUP_SECONDS)
-            logger.debug("Adjusted clock difference: " + str(adjusted_timediff_seconds) + " seconds")
-            # handle daylight saving time
-            if (reload and adjusted_timediff_seconds > MAX_TIME_DIFF_SECONDS or adjusted_timediff_seconds < -60):
-                logger.error(
-                    "Meter time is more than " + str(MAX_TIME_DIFF_SECONDS) + " seconds different to ours. (" + str(
-                        adjusted_timediff_seconds) + "s)")
-                logger.critical("Please check the meter clock, refusing to proceed!")
-                exit(6)
-            # profile_timeblocks = imp['TIMEBLOCKS']
-            bgdata = imp['BGDATA']['BG']
+            # we got some data
+            processing_seconds = int(time.time() - time_start)
+            logger.info("Scan complete after: " + str(processing_seconds) + " seconds")
 
-            payload_list = []
-
-            # process bgdata entries
-
-            for i in range(0, len(bgdata)):
-                last = bgdata[i]
-                event = 0
-                carbs = 0
-                insulin = 0
-                bg = 0.0
-                dttm = last['@Dt'] + " " + last['@Tm']
-                if last['@Val'] != "---" and float(last['@Val'] > 0):
-                    bg = float(last['@Val'])
-                if '@Carb' in last:
-                    carbs = int(last['@Carb'])
-                if '@Evt' in last:
-                    event = int(last['@Evt'])
-
-                payload = createNightScoutTreatmentRecord(dttm, bg, bgunit, carbs, insulin, event)
-                if (not payload is None and len(payload) > 0):
-                    payload_list.append(payload)
-
-            # process pump data
-            PUMPFILE = MISC_FOLDER + "I" + pumpserial[1:] + ".XML"
-            if not os.path.exists(PUMPFILE):
-                logger.error("Cannot find pump data file for pump: " + pumpserial + " " + PUMPFILE)
-                exit(8)
-
-            with open(PUMPFILE) as id:
-                idx = xmltodict.parse(id.read())
-                iimp = idx['IMPORT']
-                bolusdata = iimp['IPDATA']['BOLUS']
-                basaldata = iimp['IPDATA']['BASAL']
-                eventdata = iimp['IPDATA']['EVENT']
-
-                # boluses
-                for i in range(0, len(bolusdata)):
-                    bi = bolusdata[i]
-                    if bi['@Tm'] != "":
-                        dttm = bi['@Dt'] + " " + bi['@Tm']
-                        btype = bi['@type']
-                        insulin = bi['@amount']
-                        notes = ""
-                        if len(btype) > 0:
-                            notes = "Bolus " + btype
-                        payload = createNightScoutTreatmentRecord(dttm, 0, 0, 0, insulin, 0, notes=notes)
-                        if (not payload is None and len(payload) > 0):
-                            payload_list.append(payload)
-                            # else:
-                            # not handling daily totals yet
-                            # print bi
-
-                # TODO consolidate records
-
-                # events
-                for i in range(0, len(eventdata)):
-                    ei = eventdata[i]
-                    dttm = ei['@Dt'] + " " + ei['@Tm']
-                    if '@description' in ei:
-                        notes = ei['@description']
-                    else:
-                        notes = ""
-                    if '@shortinfo' in ei:
-                        notes += " (" + ei['@shortinfo'] + ")"
-                    payload = createNightScoutTreatmentRecord(dttm, 0, 0, 0, 0, 0, notes=notes)
-                    if (not payload is None and len(payload) > 0):
-                        payload_list.append(payload)
-
-                # basal
-                firstbasal = True
-                for i in reversed(range(0, len(basaldata))):
-                    bi = basaldata[i]
-                    dttm = bi['@Dt'] + " " + bi['@Tm']
-                    if (not firstbasal):
-                        payload = createNightScoutBasalRecord(dttm, lastdttm, cbrf, profile, remark)
-                        if (not payload is None and len(payload) > 0):
-                            payload_list.append(payload)
-                    cbrf = bi['@cbrf']
-                    profile = ""
-                    if '@profile' in bi:
-                        profile = bi['@profile']
-                    remark = ""
-                    if '@remark' in bi:
-                        remark = bi['@remark']
-
-                    firstbasal = False
-                    lastdttm = dttm
-
-                    # TODO process last if it is a TBR start
-                    # TODO process from TBR starts to TBR ends
-                    # TODO define profile from settings
-
-            logger.debug("Starting upload")
-
-            headers = {'Content-Type': "application/json", 'Accept': 'application/json',
-                       'API-SECRET': nightscout_secret_hash}
-            upload_start = time.time()
+        with open(DEVLIST_FILE) as fd:
             try:
-                result = requests.post(url="%s/api/v1/treatments" % args.base_url, headers=headers,
-                                       data=json.dumps(payload_list))
+                doc = xmltodict.parse(fd.read())
+                if not 'DEVICE' in doc['DEVICELIST']:
+                    logger.error("No device data available - try again")
+                    exit(5)
 
-                if (result.status_code == 200):
-                    logger.info("Uploaded " + str(len(payload_list)) + " records successfully in " + str(
-                        int(time.time() - upload_start)) + " seconds")
-                else:
-                    logger.error("Upload error status: %d" % result.status_code)
-                    logger.error("  Upload error text: %s" % result.text)
-            except requests.exceptions.ConnectionError as e:
-                logger.error("Upload connection error: " + str(e))
+                serial = doc['DEVICELIST']['DEVICE']['SERIALNR']
+                dclass = doc['DEVICELIST']['DEVICE']['CLASS']
+                name = doc['DEVICELIST']['DEVICE']['NAME']
+                deviceid = name + " " + serial
 
-    except Exception as e:
-        logger.error("Got error during processing: " + str(e))
+                logger.debug(dclass + " serial number is: " + serial + " name " + name)
 
-    finally:
-        unmountPix()
+                if (METER_SERIAL != "" and serial != METER_SERIAL):
+                    logger.error("Meter serials do not match: " + METER_SERIAL + " vs " + serial)
+                    exit(5)
+
+                GLUCOSE_FILE = MISC_FOLDER + "G" + serial[1:] + ".XML"
+                if not os.path.exists(GLUCOSE_FILE):
+                    logger.error("Could not find glucose data file for meter: " + METER_SERIAL + " try re-running?")
+                    exit(7)
+
+                with open(GLUCOSE_FILE) as gd:
+                    gd = xmltodict.parse(gd.read())
+                    imp = gd['IMPORT']
+                    gdev = imp['DEVICE']
+                    pairing = gdev['PAIRING']
+                    pumpserial = pairing['@PumpSerialNr']
+                    logger.debug("      Paired with pump: " + pumpserial)
+                    dt = gdev['@Dt']
+                    tm = gdev['@Tm']
+                    bgunit = gdev['@BGUnit']
+                    logger.debug("Device time is: " + dt + " " + tm)
+
+                    meterdt = mytimezone.localize(parser.parse(dt + " " + tm))
+                    logger.debug("Meter date time: " + str(meterdt))
+                    hostdt = datetime.datetime.now(mytimezone)
+                    logger.debug(" Host date time: " + str(hostdt))
+                    timediff = hostdt - meterdt
+
+                    adjusted_timediff_seconds = timediff.seconds - (processing_seconds - STARTUP_SECONDS)
+                    logger.debug("Adjusted clock difference: " + str(adjusted_timediff_seconds) + " seconds")
+                    # handle daylight saving time
+                    if (
+                                    reload and adjusted_timediff_seconds > MAX_TIME_DIFF_SECONDS or adjusted_timediff_seconds < -60):
+                        logger.error(
+                            "Meter time is more than " + str(
+                                MAX_TIME_DIFF_SECONDS) + " seconds different to ours. (" + str(
+                                adjusted_timediff_seconds) + "s)")
+                        logger.critical("Please check the meter clock, refusing to proceed!")
+                        exit(6)
+                    # profile_timeblocks = imp['TIMEBLOCKS']
+                    bgdata = imp['BGDATA']['BG']
+
+                    payload_list = []
+
+                    # process bgdata entries
+
+                    for i in range(0, len(bgdata)):
+                        last = bgdata[i]
+                        event = 0
+                        carbs = 0
+                        insulin = 0
+                        bg = 0.0
+                        dttm = last['@Dt'] + " " + last['@Tm']
+                        if last['@Val'] != "---" and float(last['@Val'] > 0):
+                            bg = float(last['@Val'])
+                        if '@Carb' in last:
+                            carbs = int(last['@Carb'])
+                        if '@Evt' in last:
+                            event = int(last['@Evt'])
+
+                        payload = createNightScoutTreatmentRecord(dttm, bg, bgunit, carbs, insulin, event)
+                        if (not payload is None and len(payload) > 0):
+                            payload_list.append(payload)
+
+                    # process pump data
+                    PUMPFILE = MISC_FOLDER + "I" + pumpserial[1:] + ".XML"
+                    if not os.path.exists(PUMPFILE):
+                        logger.error("Cannot find pump data file for pump: " + pumpserial + " " + PUMPFILE)
+                        exit(8)
+
+                    with open(PUMPFILE) as id:
+                        idx = xmltodict.parse(id.read())
+                        iimp = idx['IMPORT']
+                        bolusdata = iimp['IPDATA']['BOLUS']
+                        basaldata = iimp['IPDATA']['BASAL']
+                        eventdata = iimp['IPDATA']['EVENT']
+
+                        # boluses
+                        for i in range(0, len(bolusdata)):
+                            bi = bolusdata[i]
+                            if bi['@Tm'] != "":
+                                dttm = bi['@Dt'] + " " + bi['@Tm']
+                                btype = bi['@type']
+                                insulin = bi['@amount']
+                                notes = ""
+                                if len(btype) > 0:
+                                    notes = "Bolus " + btype
+                                payload = createNightScoutTreatmentRecord(dttm, 0, 0, 0, insulin, 0, notes=notes)
+                                if (not payload is None and len(payload) > 0):
+                                    payload_list.append(payload)
+                                    # else:
+                                    # not handling daily totals yet
+                                    # print bi
+
+                        # TODO consolidate records
+
+                        # events
+                        for i in range(0, len(eventdata)):
+                            ei = eventdata[i]
+                            dttm = ei['@Dt'] + " " + ei['@Tm']
+                            if '@description' in ei:
+                                notes = ei['@description']
+                            else:
+                                notes = ""
+                            if '@shortinfo' in ei:
+                                notes += " (" + ei['@shortinfo'] + ")"
+                            payload = createNightScoutTreatmentRecord(dttm, 0, 0, 0, 0, 0, notes=notes)
+                            if (not payload is None and len(payload) > 0):
+                                payload_list.append(payload)
+
+                        # basal
+                        firstbasal = True
+                        for i in reversed(range(0, len(basaldata))):
+                            bi = basaldata[i]
+                            dttm = bi['@Dt'] + " " + bi['@Tm']
+                            if (not firstbasal):
+                                payload = createNightScoutBasalRecord(dttm, lastdttm, cbrf, profile, remark)
+                                if (not payload is None and len(payload) > 0):
+                                    payload_list.append(payload)
+                            cbrf = bi['@cbrf']
+                            profile = ""
+                            if '@profile' in bi:
+                                profile = bi['@profile']
+                            remark = ""
+                            if '@remark' in bi:
+                                remark = bi['@remark']
+
+                            firstbasal = False
+                            lastdttm = dttm
+
+                            # TODO process last if it is a TBR start
+                            # TODO process from TBR starts to TBR ends
+                            # TODO define profile from settings
+
+                    logger.debug("Starting upload")
+
+                    headers = {'Content-Type': "application/json", 'Accept': 'application/json',
+                               'API-SECRET': nightscout_secret_hash}
+                    upload_start = time.time()
+                    try:
+                        result = requests.post(url="%s/api/v1/treatments" % args.base_url, headers=headers,
+                                               data=json.dumps(payload_list))
+
+                        if (result.status_code == 200):
+                            logger.info("Uploaded " + str(len(payload_list)) + " records successfully in " + str(
+                                int(time.time() - upload_start)) + " seconds")
+                            if args.constant:
+                                if (args.relay_pin > 0):
+                                    logger.debug("Delaying before switching off relay")
+                                    time.sleep(20)
+                                    enableRelay(args.relay_pin, False)
+                                logger.info("Waiting for " + (
+                                    str(int(WAIT_BETWEEN_SUCCESSES / 60))) + " minutes due to success")
+                                time.sleep(WAIT_BETWEEN_SUCCESSES)
+
+                        else:
+                            logger.error("Upload error status: %d" % result.status_code)
+                            logger.error("  Upload error text: %s" % result.text)
+                    except requests.exceptions.ConnectionError as e:
+                        logger.error("Upload connection error: " + str(e))
+            except BreakException:
+                logger.debug("Got break exception")
+
+            except Exception as e:
+                logger.error("Got error during processing: " + str(e))
+
+            finally:
+                unmountPix()
+    except BreakException:
+        logger.debug("Got outer break exception")
